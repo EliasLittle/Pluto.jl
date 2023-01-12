@@ -53,7 +53,12 @@ function notebook_response(notebook; home_url="./", as_redirect=true)
 end
 
 function get_header(request::HTTP.Request, key::AbstractString)
-    val = request.headers[findfirst(x -> (lowercase(x.first) == lowercase(key)), request.headers)]
+    validx = findfirst(x -> (lowercase(x.first) == lowercase(key)), request.headers)
+    if isnothing(validx)
+        return nothing
+    end
+
+    val = request.headers[validx]
     if !isnothing(val)
         return val.second
     end
@@ -258,20 +263,21 @@ function http_router_for(session::ServerSession)
 
         notebook
     end
-    function rest_parse(body::Vector{UInt8}, mime_type::AbstractString)
-        # TODO: either fix or remove json support
+    function rest_parse(body::Vector{UInt8}, mime_type::Union{AbstractString, Nothing})
         if mime_type == "application/x-msgpack"
             return MsgPack.unpack(body)
         elseif mime_type == "application/x-julia"
             return Serialization.deserialize(IOBuffer(body))
         else
-            @error "Unrecognized MIME type for REST request body"
+            # For some reason JSON.parse mutates body
+            # so we need to make a copy of it
+            jsonstr = String(copy(body))
+            return JSON.parse(jsonstr)
         end
     end
     function rest_parameter(request::HTTP.Request, key::AbstractString, default=nothing)
         uri = HTTP.URI(request.target)
         query = HTTP.queryparams(uri)
-        parts = HTTP.URIs.splitpath(uri.path)
 
         content_type = get_header(request, "Content-Type")
         if haskey(query, key)
@@ -284,15 +290,15 @@ function http_router_for(session::ServerSession)
     function rest_serialize(request::HTTP.Request, body)
         accept_type = get_header(request, "Accept")
         try
-            if accept_type == "application/json"
-                return HTTP.Response(200, JSON.json(body)) |> with_json! |> with_cors!
+            if accept_type == "application/x-msgpack"
+                return HTTP.Response(200, Pluto.pack(body)) |> with_msgpack! |> with_cors!
             elseif accept_type == "application/x-julia"
                 out_io = IOBuffer()
                 Serialization.serialize(out_io, body)
                 serialized_msg = take!(out_io)
                 return HTTP.Response(200, serialized_msg) |> with_julia! |> with_cors!
             else 
-                return HTTP.Response(200, Pluto.pack(body)) |> with_msgpack! |> with_cors!
+                return HTTP.Response(200, JSON.json(body)) |> with_json! |> with_cors!
             end
         catch e
             # Likely an error serializing the object
@@ -372,20 +378,15 @@ function http_router_for(session::ServerSession)
                 return HTTP.Response(400, e.msg)
             end
         end
-
         rest_serialize(request, outputs)
     end
-    HTTP.@register(router, "GET", "/$(REST.VERSION)/notebook/*/eval", serve_notebook_eval)
-    HTTP.@register(router, "POST", "/$(REST.VERSION)/notebook/*/eval", serve_notebook_eval)
+    HTTP.@register(router, "GET", "/$(REST.WYSIWYR_VERSION)/notebook/*/eval", serve_notebook_eval)
+    HTTP.@register(router, "POST", "/$(REST.WYSIWYR_VERSION)/notebook/*/eval", serve_notebook_eval)
 
     function serve_notebook_call(request::HTTP.Request)
-        @warn "Notebook Call"
         # Get notebook from request parameters
         notebook = get_notebook_from_api_request(request)
         topology = notebook.topology
-
-        uri = HTTP.URI(request.target)
-        query = HTTP.queryparams(uri)
 
         fn_name = Symbol(rest_parameter(request, "function"))
         args = rest_parameter(request, "args")
@@ -404,27 +405,25 @@ function http_router_for(session::ServerSession)
 
         rest_serialize(request, fn_result)
     end
-    HTTP.@register(router, "GET", "/$(REST.VERSION)/notebook/*/call", serve_notebook_call)
-    HTTP.@register(router, "POST", "/$(REST.VERSION)/notebook/*/call", serve_notebook_call)
+    HTTP.@register(router, "GET", "/$(REST.WYSIWYR_VERSION)/notebook/*/call", serve_notebook_call)
+    HTTP.@register(router, "POST", "/$(REST.WYSIWYR_VERSION)/notebook/*/call", serve_notebook_call)
 
     function serve_notebook_static_fn(request::HTTP.Request)
         uri = HTTP.URI(request.target)
         query = HTTP.queryparams(uri)
 
-        parts = HTTP.URIs.splitpath(uri.path)
         out_symbols = Symbol.(split(query["outputs"], ","))
 
         notebook = get_notebook_from_api_request(request)
-        topology = notebook.topology
 
         input_symbols = Symbol.(split(query["inputs"], ","))
-        out_fn = REST.get_notebook_static_function(session, notebook, topology, input_symbols, out_symbols)
+        out_fn = REST.get_notebook_static_function(session, notebook, notebook.topology, input_symbols, out_symbols)
 
         res = HTTP.Response(200, string(out_fn))
         push!(res.headers, "Content-Type" => "text/plain; charset=utf-8")
         res
     end
-    HTTP.@register(router, "GET", "/$(REST.VERSION)/notebook/*/static", serve_notebook_static_fn)
+    HTTP.@register(router, "GET", "/$(REST.WYSIWYR_VERSION)/notebook/*/static", serve_notebook_static_fn)
 
     notebook_from_uri(request) = let
         uri = HTTP.URI(request.target)        
@@ -439,7 +438,7 @@ function http_router_for(session::ServerSession)
         try
             notebook = notebook_from_uri(request)
             response = HTTP.Response(200, sprint(save_notebook, notebook))
-            push!(response.headers, "Content-Type" => "text/plain; charset=utf-8")
+            push!(response.headers, "Content-Type" => "text/julia; charset=utf-8")
             push!(response.headers, "Content-Disposition" => "inline; filename=\"$(basename(notebook.path))\"")
             response
         catch e
@@ -447,6 +446,22 @@ function http_router_for(session::ServerSession)
         end
     end
     HTTP.@register(router, "GET", "/notebookfile", serve_notebookfile)
+
+    serve_statefile = with_authentication(; 
+        required=security.require_secret_for_access || 
+        security.require_secret_for_open_links
+    ) do request::HTTP.Request
+        try
+            notebook = notebook_from_uri(request)
+            response = HTTP.Response(200, Pluto.pack(Pluto.notebook_to_js(notebook)))
+            push!(response.headers, "Content-Type" => "application/octet-stream")
+            push!(response.headers, "Content-Disposition" => "inline; filename=\"$(without_pluto_file_extension(basename(notebook.path))).plutostate\"")
+            response
+        catch e
+            return error_response(400, "Bad query", "Please <a href='https://github.com/fonsp/Pluto.jl/issues'>report this error</a>!", sprint(showerror, e, stacktrace(catch_backtrace())))
+        end
+    end
+    HTTP.@register(router, "GET", "/statefile", serve_statefile)
 
     serve_notebookexport = with_authentication(; 
         required=security.require_secret_for_access || 
@@ -463,6 +478,22 @@ function http_router_for(session::ServerSession)
         end
     end
     HTTP.@register(router, "GET", "/notebookexport", serve_notebookexport)
+    
+    serve_notebookupload = with_authentication(; 
+        required=security.require_secret_for_access || 
+        security.require_secret_for_open_links
+    ) do request::HTTP.Request
+        save_path = SessionActions.save_upload(request.body)
+        try_launch_notebook_response(
+            SessionActions.open,
+            save_path,
+            as_redirect=false,
+            as_sample=false,
+            title="Failed to load notebook",
+            advice="Make sure that you copy the entire notebook file. Please <a href='https://github.com/fonsp/Pluto.jl/issues'>report this error</a>!"
+        )
+    end
+    HTTP.@register(router, "POST", "/notebookupload", serve_notebookupload)
     
     function serve_asset(request::HTTP.Request)
         uri = HTTP.URI(request.target)
